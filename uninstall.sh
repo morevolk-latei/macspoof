@@ -8,6 +8,7 @@ set -e
 
 LOCATIONS=(
     "/usr/local/bin/macspoof"
+    "/opt/homebrew/bin/macspoof"
     "$HOME/.local/bin/macspoof"
 )
 

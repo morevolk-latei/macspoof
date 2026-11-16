@@ -18,22 +18,26 @@ fi
 
 echo "==> Detected $CHIP ($ARCH)..."
 
-# Determine installation directory
-INSTALL_DIR="/usr/local/bin"
+# Determine target installation directory
+# /usr/local/bin is in macOS /etc/paths by default for all users.
+INSTALL_DIR=""
 USE_SUDO=false
 
-if [ ! -d "$INSTALL_DIR" ]; then
+if [ -d "/opt/homebrew/bin" ] && [[ ":$PATH:" == *":/opt/homebrew/bin:"* ]] && [ -w "/opt/homebrew/bin" ]; then
+    INSTALL_DIR="/opt/homebrew/bin"
+elif [ -d "/usr/local/bin" ] && [ -w "/usr/local/bin" ]; then
+    INSTALL_DIR="/usr/local/bin"
+elif command -v sudo >/dev/null 2>&1; then
+    INSTALL_DIR="/usr/local/bin"
+    USE_SUDO=true
+else
     INSTALL_DIR="$HOME/.local/bin"
     mkdir -p "$INSTALL_DIR"
-elif [ ! -w "$INSTALL_DIR" ]; then
-    USE_SUDO=true
 fi
 
-# Source location: check if running from cloned repository or curl pipe
+# Prepare source file
 REPO_RAW_URL="https://raw.githubusercontent.com/morevolk-latei/macspoof/main/bin/macspoof"
 LOCAL_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bin/macspoof"
-
-TARGET="$INSTALL_DIR/macspoof"
 TEMP_FILE="/tmp/macspoof.$$"
 
 if [ -f "$LOCAL_BIN" ]; then
@@ -45,27 +49,47 @@ else
 fi
 
 chmod +x "$TEMP_FILE"
+TARGET="$INSTALL_DIR/macspoof"
 
 if [ "$USE_SUDO" = true ]; then
-    echo "==> Administrator (sudo) password required to install to $INSTALL_DIR:"
+    echo "==> Installing to $INSTALL_DIR (system-wide, requires sudo)..."
+    sudo mkdir -p "$INSTALL_DIR"
     sudo cp "$TEMP_FILE" "$TARGET"
     sudo chmod +x "$TARGET"
 else
+    mkdir -p "$INSTALL_DIR"
     cp "$TEMP_FILE" "$TARGET"
     chmod +x "$TARGET"
 fi
 
 rm -f "$TEMP_FILE"
-
 echo "==> Successfully installed macspoof to $TARGET"
 
-# Check PATH
+# Verify whether INSTALL_DIR is in the active PATH
+PATH_UPDATED=false
 if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
-    echo "==> Warning: $INSTALL_DIR is not currently in your PATH."
-    echo "    Add this line to your ~/.zshrc or ~/.bash_profile:"
-    echo "    export PATH=\"$INSTALL_DIR:\$PATH\""
+    SHELL_CONFIG=""
+    if [ -n "$ZSH_VERSION" ] || [ -f "$HOME/.zshrc" ] || [[ "$SHELL" == */zsh ]]; then
+        SHELL_CONFIG="$HOME/.zshrc"
+    elif [ -f "$HOME/.bash_profile" ] || [[ "$SHELL" == */bash ]]; then
+        SHELL_CONFIG="$HOME/.bash_profile"
+    fi
+
+    if [ -n "$SHELL_CONFIG" ]; then
+        if ! grep -q "$INSTALL_DIR" "$SHELL_CONFIG" 2>/dev/null; then
+            echo "export PATH=\"$INSTALL_DIR:\$PATH\"" >> "$SHELL_CONFIG"
+            PATH_UPDATED=true
+        fi
+    fi
 fi
 
 echo ""
-echo "Test the installation by running:"
-echo "  macspoof status"
+if [ "$PATH_UPDATED" = true ]; then
+    echo "⚡ Important: Added $INSTALL_DIR to your PATH in $SHELL_CONFIG."
+    echo "   To start using macspoof right away, reload your shell:"
+    echo "       source $SHELL_CONFIG"
+    echo "   or open a new terminal window."
+else
+    echo "✓ Ready to use! Try running:"
+    echo "    macspoof status"
+fi
