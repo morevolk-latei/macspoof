@@ -1,0 +1,409 @@
+#!/usr/bin/env bash
+#
+# macspoof - MAC Address Changer & Reset Utility for Apple Silicon (M1/M2/M3/M4) Macs
+# https://github.com/morevolk-latei/macspoof
+#
+
+set -e
+
+VERSION="1.2.0"
+
+# --- Apple Silicon Verification ---
+CHIP_NAME=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "Unknown")
+ARCH=$(uname -m 2>/dev/null || echo "Unknown")
+
+verify_apple_silicon() {
+    if [[ "$ARCH" != "arm64" ]] || [[ ! "$CHIP_NAME" =~ Apple\ M[0-9] ]]; then
+        echo -e "\033[0;31mError: Incompatible Architecture ($ARCH / $CHIP_NAME).\033[0m" >&2
+        echo -e "\033[0;31mThis utility is exclusively built for Apple Silicon (M-series: M1, M2, M3, M4) Macs.\033[0m" >&2
+        exit 1
+    fi
+}
+verify_apple_silicon
+
+# --- TTY & Color Configuration ---
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    BOLD="\033[1m"
+    GREEN="\033[0;32m"
+    YELLOW="\033[0;33m"
+    CYAN="\033[0;36m"
+    RED="\033[0;31m"
+    RESET="\033[0m"
+else
+    BOLD=""
+    GREEN=""
+    YELLOW=""
+    CYAN=""
+    RED=""
+    RESET=""
+fi
+
+# --- Absolute Path Resolution (handles symlinks and sudo re-exec) ---
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SCRIPT_SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+    SCRIPT_SOURCE="$(readlink "$SCRIPT_SOURCE")"
+    [[ $SCRIPT_SOURCE != /* ]] && SCRIPT_SOURCE="$DIR/$SCRIPT_SOURCE"
+done
+SCRIPT_PATH="$(cd -P "$(dirname "$SCRIPT_SOURCE")" && pwd)/$(basename "$SCRIPT_SOURCE")"
+
+# --- Helper Functions ---
+
+# Auto-detect default Wi-Fi interface (usually en0)
+get_default_wifi() {
+    networksetup -listallhardwareports 2>/dev/null | awk '
+        $1 == "Hardware" && $2 == "Port:" { port = substr($0, 16) }
+        $1 == "Device:" && port ~ /Wi-Fi|AirPort/ { print $2; exit }
+    '
+}
+
+# Check if an interface is Wi-Fi
+is_wifi() {
+    local dev="$1"
+    local port
+    port=$(networksetup -listallhardwareports 2>/dev/null | awk -v d="$dev" '
+        $1 == "Hardware" && $2 == "Port:" { p = substr($0, 16) }
+        $1 == "Device:" && $2 == d { print p; exit }
+    ')
+    if [[ "$port" =~ (Wi-Fi|AirPort) ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Get permanent hardware MAC address from hardware ports
+get_hardware_mac() {
+    local dev="$1"
+    networksetup -listallhardwareports 2>/dev/null | awk -v d="$dev" '
+        $1 == "Device:" { current_dev = $2 }
+        $1 == "Ethernet" && $2 == "Address:" {
+            if (current_dev == d) {
+                print tolower($3)
+                exit
+            }
+        }
+    '
+}
+
+# Get currently active MAC address
+get_current_mac() {
+    local dev="$1"
+    ifconfig "$dev" 2>/dev/null | awk '/ether / {print tolower($2); exit}'
+}
+
+# Generate a random, valid unicast, locally-administered MAC address
+generate_random_mac() {
+    # Locally administered unicast has bit 0 = 0 and bit 1 = 1 in byte 0
+    # The second hex character of byte 0 must be 2, 6, a, or e.
+    local choices=("2" "6" "a" "e")
+    local suffix="${choices[$((RANDOM % 4))]}"
+    local prefix=$(printf "%x" $((RANDOM % 16)))
+    local octet1="${prefix}${suffix}"
+    local rest
+    rest=$(openssl rand -hex 5 2>/dev/null | sed 's/\(..\)/\1:/g; s/:$//')
+    echo "${octet1}:${rest}"
+}
+
+# Validate format and ensure it is not multicast
+validate_mac() {
+    local mac="$1"
+    if [[ ! "$mac" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]; then
+        echo -e "${RED}Error: Invalid MAC address format: '$mac'. Expected format: XX:XX:XX:XX:XX:XX${RESET}" >&2
+        return 1
+    fi
+    local first_byte="0x${mac%%:*}"
+    if (( (first_byte & 1) != 0 )); then
+        echo -e "${RED}Error: MAC address '$mac' is a multicast address (odd first byte). Please use a unicast address.${RESET}" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Ensure root privileges when modifying network state
+ensure_root() {
+    if [ "$EUID" -ne 0 ]; then
+        echo -e "${YELLOW}Administrator (sudo) privileges required to change MAC address.${RESET}"
+        exec sudo "$SCRIPT_PATH" "$@"
+    fi
+}
+
+# --- Command Implementations ---
+
+cmd_status() {
+    local dev="$1"
+    local raw_mode="${2:-false}"
+    local hw_mac cur_mac wifi_note
+
+    hw_mac=$(get_hardware_mac "$dev")
+    cur_mac=$(get_current_mac "$dev")
+
+    if [ -z "$cur_mac" ]; then
+        echo -e "${RED}Error: Interface '$dev' not found or has no active MAC address.${RESET}" >&2
+        exit 1
+    fi
+
+    if [ "$raw_mode" = "true" ]; then
+        echo "$cur_mac"
+        return 0
+    fi
+
+    if is_wifi "$dev"; then
+        wifi_note=" (Wi-Fi)"
+    else
+        wifi_note=""
+    fi
+
+    echo -e "${BOLD}Apple Silicon:${RESET} ${CYAN}${CHIP_NAME} (${ARCH})${RESET}"
+    echo -e "${BOLD}Interface:${RESET}     ${CYAN}${dev}${wifi_note}${RESET}"
+    echo -e "${BOLD}Current MAC:${RESET}   ${cur_mac}"
+    echo -e "${BOLD}Hardware MAC:${RESET}  ${hw_mac:-Unknown}"
+
+    if [ -n "$hw_mac" ]; then
+        if [ "$cur_mac" = "$hw_mac" ]; then
+            echo -e "${BOLD}Status:${RESET}        ${GREEN}ORIGINAL (Hardware MAC in use)${RESET}"
+        else
+            echo -e "${BOLD}Status:${RESET}        ${YELLOW}SPOOFED (Custom / Randomized MAC in use)${RESET}"
+        fi
+    fi
+}
+
+cmd_list() {
+    echo -e "${BOLD}Apple Silicon Network Interfaces (${CHIP_NAME}):${RESET}"
+    printf "%-10s %-24s %-19s %-19s %-10s\n" "INTERFACE" "HARDWARE PORT" "HARDWARE MAC" "CURRENT MAC" "STATUS"
+    printf "%-10s %-24s %-19s %-19s %-10s\n" "---------" "-------------" "------------" "-----------" "------"
+
+    networksetup -listallhardwareports 2>/dev/null | awk '
+        $1 == "Hardware" && $2 == "Port:" { port = substr($0, 16) }
+        $1 == "Device:" { dev = $2 }
+        $1 == "Ethernet" && $2 == "Address:" {
+            mac = tolower($3)
+            print dev "\t" port "\t" mac
+        }
+    ' | while IFS=$'\t' read -r dev port hwmac; do
+        curmac=$(get_current_mac "$dev")
+        [ -z "$curmac" ] && curmac="N/A"
+        
+        status="-"
+        if [ "$curmac" != "N/A" ] && [ -n "$hwmac" ]; then
+            if [ "$curmac" = "$hwmac" ]; then
+                status="Original"
+            else
+                status="Spoofed"
+            fi
+        fi
+        printf "%-10s %-24s %-19s %-19s %-10s\n" "$dev" "$port" "$hwmac" "$curmac" "$status"
+    done
+}
+
+cmd_apply() {
+    local dev="$1"
+    local target_mac="$2"
+    local orig_mac
+
+    target_mac=$(echo "$target_mac" | tr 'A-Z-' 'a-z:')
+    validate_mac "$target_mac" || exit 1
+
+    orig_mac=$(get_current_mac "$dev")
+    if [ "$orig_mac" = "$target_mac" ]; then
+        echo -e "${YELLOW}Interface $dev is already using MAC: $target_mac${RESET}"
+        return 0
+    fi
+
+    echo -e "Applying MAC ${CYAN}$target_mac${RESET} to interface ${CYAN}$dev${RESET}..."
+
+    if is_wifi "$dev"; then
+        # 1. Disassociate from current Wi-Fi network if airport binary is present
+        local airport_bin="/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport"
+        if [ -x "$airport_bin" ]; then
+            "$airport_bin" -z 2>/dev/null || true
+        fi
+
+        # 2. Direct attempt first
+        if ! ifconfig "$dev" ether "$target_mac" 2>/dev/null; then
+            # 3. Cycle Wi-Fi power and apply in a fast retry loop before Apple Silicon auto-associates
+            echo -e "${YELLOW}Cycling Wi-Fi power on ${CHIP_NAME}...${RESET}"
+            networksetup -setairportpower "$dev" off 2>/dev/null || true
+            sleep 0.4
+            networksetup -setairportpower "$dev" on 2>/dev/null || true
+
+            local applied=false
+            for attempt in 1 2 3 4 5; do
+                if ifconfig "$dev" ether "$target_mac" 2>/dev/null; then
+                    applied=true
+                    break
+                fi
+                sleep 0.15
+            done
+
+            if [ "$applied" = false ]; then
+                ifconfig "$dev" ether "$target_mac" 2>/dev/null || true
+            fi
+        fi
+    else
+        # Ethernet / Thunderbolt / Bridge
+        ifconfig "$dev" down 2>/dev/null || true
+        if ! ifconfig "$dev" ether "$target_mac" 2>/dev/null; then
+            echo -e "${RED}Note: Many physical Ethernet and USB-C adapters do not support software MAC spoofing.${RESET}" >&2
+        fi
+        ifconfig "$dev" up 2>/dev/null || true
+    fi
+
+    sleep 0.5
+    local new_mac
+    new_mac=$(get_current_mac "$dev")
+
+    if [ "$new_mac" = "$target_mac" ]; then
+        echo -e "${GREEN}✓ Successfully set MAC of $dev to: $new_mac${RESET}"
+    else
+        echo -e "${RED}✗ Failed to apply MAC to $dev. Current MAC: ${new_mac:-Unknown}${RESET}" >&2
+        echo -e "${YELLOW}Tip: In macOS System Settings > Wi-Fi, ensure 'Private Wi-Fi Address' is turned off if it overrides manual changes.${RESET}" >&2
+        exit 1
+    fi
+}
+
+cmd_reset() {
+    local dev="$1"
+    local hw_mac
+    hw_mac=$(get_hardware_mac "$dev")
+
+    if [ -z "$hw_mac" ]; then
+        echo -e "${RED}Error: Could not retrieve original hardware MAC for interface '$dev'.${RESET}" >&2
+        exit 1
+    fi
+
+    echo -e "Resetting interface ${CYAN}$dev${RESET} to original hardware address (${CYAN}$hw_mac${RESET})..."
+    cmd_apply "$dev" "$hw_mac"
+}
+
+show_help() {
+    echo -e "${BOLD}macspoof v${VERSION}${RESET} - MAC Address Changer for Apple Silicon (${CYAN}${CHIP_NAME}${RESET})"
+    echo ""
+    echo -e "${BOLD}Usage:${RESET}"
+    echo "  macspoof [command] [options]"
+    echo ""
+    echo -e "${BOLD}Commands:${RESET}"
+    echo "  status                  Show current and hardware MAC (default)"
+    echo "  random, rand            Generate and apply a random valid MAC address"
+    echo "  reset, restore          Reset back to the original hardware MAC address"
+    echo "  set <mac_address>       Set a specific custom MAC address"
+    echo "  list                    List all network interfaces and their MACs"
+    echo "  version, -v, --version  Show version and architecture details"
+    echo "  help, -h, --help        Show this help message"
+    echo ""
+    echo -e "${BOLD}Options:${RESET}"
+    echo "  -i, --interface <iface> Specify target network interface (default: active Wi-Fi, e.g. en0)"
+    echo "  -r, --raw               Output only the MAC address (ideal for scripts)"
+    echo ""
+    echo -e "${BOLD}Examples:${RESET}"
+    echo "  macspoof                # Check current status"
+    echo "  macspoof random         # Randomize Wi-Fi MAC address"
+    echo "  macspoof reset          # Revert to original hardware MAC"
+    echo "  macspoof set 02:4a:bc:12:34:56"
+    echo "  macspoof status --raw   # Output only MAC: ee:5c:7a:fd:45:4e"
+    echo "  macspoof list           # View all interfaces"
+    echo ""
+    echo -e "${BOLD}Notes:${RESET}"
+    echo "  • Changes are temporary and automatically revert upon system reboot."
+    echo "  • Requires sudo password only when applying or resetting a MAC address."
+}
+
+# --- CLI Argument Parsing ---
+INTERFACE=""
+COMMAND=""
+TARGET_MAC=""
+RAW_MODE="false"
+ORIGINAL_ARGS=("$@")
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -i|--interface)
+            shift
+            if [ -z "$1" ]; then
+                echo -e "${RED}Error: --interface requires an argument.${RESET}" >&2
+                exit 1
+            fi
+            INTERFACE="$1"
+            shift
+            ;;
+        -r|--raw)
+            RAW_MODE="true"
+            shift
+            ;;
+        -v|--version|version)
+            echo "macspoof v${VERSION} (${CHIP_NAME} - ${ARCH})"
+            exit 0
+            ;;
+        -h|--help|help)
+            show_help
+            exit 0
+            ;;
+        status|list|random|rand|reset|restore|original)
+            COMMAND="$1"
+            shift
+            ;;
+        set)
+            COMMAND="set"
+            shift
+            if [ -n "$1" ] && [[ ! "$1" =~ ^- ]]; then
+                TARGET_MAC="$1"
+                shift
+            fi
+            ;;
+        *)
+            if [[ "$1" =~ ^([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}$ ]]; then
+                COMMAND="set"
+                TARGET_MAC="$1"
+                shift
+            else
+                echo -e "${RED}Unknown command or option: '$1'${RESET}" >&2
+                echo ""
+                show_help
+                exit 1
+            fi
+            ;;
+    esac
+done
+
+if [ -z "$COMMAND" ]; then
+    COMMAND="status"
+fi
+
+if [ "$COMMAND" = "list" ]; then
+    cmd_list
+    exit 0
+fi
+
+if [ -z "$INTERFACE" ]; then
+    INTERFACE=$(get_default_wifi)
+    if [ -z "$INTERFACE" ]; then
+        INTERFACE=$(route get default 2>/dev/null | awk '/interface:/ {print $2; exit}')
+    fi
+    if [ -z "$INTERFACE" ]; then
+        INTERFACE="en0"
+    fi
+fi
+
+case "$COMMAND" in
+    status)
+        cmd_status "$INTERFACE" "$RAW_MODE"
+        ;;
+    random|rand)
+        ensure_root "${ORIGINAL_ARGS[@]}"
+        RANDOM_MAC=$(generate_random_mac)
+        cmd_apply "$INTERFACE" "$RANDOM_MAC"
+        ;;
+    reset|restore|original)
+        ensure_root "${ORIGINAL_ARGS[@]}"
+        cmd_reset "$INTERFACE"
+        ;;
+    set)
+        if [ -z "$TARGET_MAC" ]; then
+            echo -e "${RED}Error: 'set' command requires a MAC address.${RESET}" >&2
+            echo "Usage: macspoof set <XX:XX:XX:XX:XX:XX>" >&2
+            exit 1
+        fi
+        ensure_root "${ORIGINAL_ARGS[@]}"
+        cmd_apply "$INTERFACE" "$TARGET_MAC"
+        ;;
+esac
